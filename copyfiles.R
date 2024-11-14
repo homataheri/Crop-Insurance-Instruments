@@ -1,4 +1,5 @@
-rm(list=ls(all=TRUE));library(data.table)
+rm(list=ls(all=TRUE));
+library(data.table)
 
 farmpolicydata <-ifelse(toupper(Sys.getenv("USERNAME")) %in% "FRANCIS.TSIBOE",
                         "C:/Users/Francis.Tsiboe/USDA/Turner, Dylan - REE-ERS - farmpolicydata/","")

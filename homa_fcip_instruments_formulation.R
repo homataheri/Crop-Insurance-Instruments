@@ -1,0 +1,251 @@
+
+# Prepared By Homa Taheri based on the code from Francis Tsiboe (ftsiboe@hotmail.com)  
+# Modification: it simplifies the original code by dividing the three layer code into multiple functions
+# Citation requirement;
+# 1. Tsiboe,F. and Turner, D., 2023. Econometric identification of crop insurance participation. Agricultural and Resource Economics Review, 52(3):476-497. https://doi.org/10.1017/age.2023.13
+# 2. Tsiboe,F. and Turner, D., 2023. The crop insurance demand response to premium subsidies: Evidence from US Agriculture. Food Policy, 119. https://doi.org/10.1016/j.foodpol.2023.102505
+
+rm(list=ls(all=TRUE));gc();library(data.table);library(magrittr)
+# Read and process the Sum of Business Coverages (SOBCOV) dataset
+sobcov <- as.data.frame(
+  data.table::rbindlist(
+    lapply(
+      list.files(recursive = T,full.names = T,pattern = "sobcov_"),
+      function(file){
+        return(readRDS(file))
+      }), fill = TRUE))
+
+sobcov$net_acre_qty <- ifelse(grepl("ACRE", sobcov$net_acre_typ), sobcov$net_acre_qty, 0) # notice that the grepl function does not look for an exact match by default. If I want to find an exact match, I should follow this: grepl("^apple$", text) and specify the beginning and ending point of the word I am interested in.
+setDT(sobcov) #convert data.frame to data.table for faster analysis
+sobcov <- sobcov[, .(net_acre = sum(net_acre_qty, na.rm = TRUE),
+                     liability_amt = sum(liability_amt, na.rm = TRUE),
+                     indem_amt = sum(indem_amt, na.rm = TRUE)),
+                 by = c("crop_yr","state_cd","state_ab","county_cd","county","crop_cd","crop")]
+
+# Read and process the Sum of Business Coverage for Standard Commodity (SOBSCC) dataset
+sobscc <- readRDS("sobscc_1948_1990.rds")
+setDT(sobscc)
+sobscc <- sobscc[, .(net_acre = sum(net_acre_qty, na.rm = TRUE),
+                     liability_amt = sum(liability_amt, na.rm = TRUE),
+                     indem_amt = sum(indem_amt, na.rm = TRUE)),
+                 by = c("crop_yr","state_cd","state_ab","county_cd","county","crop_cd","crop")]
+
+# Combine datasets, splitting at the year 1989
+soball <- rbind(sobscc[crop_yr < 1989], sobcov[crop_yr >= 1989])
+
+# Aggregate over the new dataset without specific crop codes
+soball00 <- sobscc[, .(net_acre = sum(net_acre, na.rm = TRUE),
+                       liability_amt = sum(liability_amt, na.rm = TRUE),
+                       indem_amt = sum(indem_amt, na.rm = TRUE)),
+                   by = c("crop_yr","state_cd","state_ab","county_cd","county")]
+soball00[, crop_cd := 0] # Adds a new column crop_cd to the soball00 data table (or modifies it if it already exists) and sets all values in the crop_cd column to 0.
+soball00[, crop := "All crops"] #Adds a new column crop to the soball00 data table (or modifies it if it already exists) and sets all values in the crop column to the text "All crops".
+# Append datasets, excluding the generic crop code from the combined dataset
+soball <- rbind(soball00, soball[!crop_cd %in% 9999])
+
+# Remove temporary datasets to free up memory
+rm(soball00, sobscc, sobcov)
+
+# Calculate Loss Cost Ratio (LCR) for risk assessment
+soball[, lcr := indem_amt/liability_amt] # This line of code in R is creating a new column called lcr in the soball data.table by calculating the ratio of indem_amt to liability_amt for each row.This operation is performed in-place, meaning the column is added directly to soball without creating a new copy of the data.
+
+# Define helper function for calculating the "unloaded rate", tau 
+library(dplyr)
+
+# Helper function to load and format contiguous county data
+load_contiguous_data <- function() {
+  contiguous <-  readRDS("ContiguousCounty.rds")
+  contiguous <-  as.data.table(contiguous)
+  contiguous[, state_cd := State.Code]
+  contiguous[, county_cd := County.Code]
+  return(contiguous)
+}
+
+# Helper function to calculate unloaded rate (tau) for a single county
+
+calculate_unloaded_rate <- function(ss, worklist, statplan, contiguous){
+  tryCatch({
+    group_data <- worklist[ss][contiguous, on = .(state_cd, county_cd), nomatch = 0][, .(state_cd = Contiguous.State.Code, county_cd = Contiguous.County.Code)] # This line of code: 1-Extracts a single row from worklist (indexed by ss). 2- Joins it with the contiguous data on matching state_cd and county_cd values. 3-Returns only the Contiguous.State.Code and Contiguous.County.Code columns from the contiguous table, renaming them to state_cd and county_cd.
+    
+    target_data <- worklist[ss][statplan, on = .(state_cd, county_cd), notmatch = 0]
+    
+    group_data <- unique(rbind(group_data[statplan, on = .(state_cd, county_cd), notmatch = 0], target_data))
+    
+    group_data <- group_data[, .(
+      c_alpha = mean(net_acre, na.rm = TRUE),
+      c_a = var(lcr, na.rm = TRUE),
+      c_u = mean(lcr, na.rm = TRUE)
+    ), by = .(crop_cd)]
+    
+    target_data <- target_data[, .(
+      c_v = var(lcr, na.rm = TRUE),
+      c_x = mean(lcr, na.rm = TRUE),
+      c_net_acre = sum(net_acre, na.rm = TRUE)
+    ), by = .(state_cd, county_cd, crop_cd)] 
+    
+    data <-  target_data[group_data, on = .(crop_cd), nomatch = 0]
+    
+    data[, `:=`(
+      c_P = c_net_acre/c_alpha,
+      c_K = c_v/c_a,
+      c_Z = c_P/(c_P + c_K),
+      tau = c_Z * c_x + (1- c_Z)* c_u
+    )]
+   
+     return(data[, .(state_cd, county_cd, crop_cd, tau)])   
+  }, error = function(e) NULL) 
+}
+
+# Function to handle missing values with contiguous county averages
+
+fill_missing_values <- function(ADM, contiguous){
+  contiguous_adm <-  unique(contiguous, by = c("State.Code", "County.Code"))
+  filled_data <- rbindlist(
+    lapply(1:nrow(contiguous_adm)), function(ss){
+      tryCatch({
+        data <- contiguous_adm[ss][contiguous, on = .(State.Code, County.Code), nomatch = 0][
+          ADM, on = .(state_cd, county_cd), nomatch = 0]
+        data <- data[, .(tau_c = mean(tau, na.rm = TRUE)), by = .(State.Code, County.Code, crop_cd)]
+        setnames(data, old = c("State.Code", "County.Code"), new = c("state_cd", "county_cd"))
+        return(data)
+      }, error = function(e) NULL}), fill = TRUE)
+
+ADM <- ADM[filled_data, on = intersect(names(ADM), names(filled_data)), nomatch = 0]
+ADM[, tau := ifelse(is.na(tau)| tau %>% c(Inf, -Inf, NaN, 0) , tau_c, tau)]
+return(ADM)
+}
+
+
+
+
+# Loop through years to process data and calculate target rate (tau).
+instruments <- as.data.frame(
+  data.table::rbindlist(
+    lapply(
+      (min(soball$crop_yr)+22):max(soball$crop_yr), # run the code for years 1970 onwards (minimum year + 22)
+      function(year){
+        tryCatch({ # tryCatch handles errors gracefully and continue the loop if an error occurs
+          # year <- 1970
+          # Extract relevant years of data for each county
+          statplan <- soball[crop_yr %in% (year-2):(year-21)] 
+          
+          # List of unique state and county combinations
+          worklist <- unique(statplan[, .(state_cd, county_cd)])
+          
+          # Read contiguous county data for spatial analysis
+          contiguous <- readRDS("ContiguousCounty.rds")
+          contiguous$state_cd  <- contiguous$State.Code
+          contiguous$county_cd <- contiguous$County.Code
+          setDT(contiguous)
+          
+          # Process data for each county, calculating unloaded rate (ULR)
+          ADM <- data.table::rbindlist(
+            lapply(
+              1:nrow(worklist),
+              function(ss){
+                tryCatch({
+                  # ss <- 1
+                  # The calculations in this loop are based on procedures found on page 65-70 of 2009 FCIC Rate Methodology Handbook APH
+                  # https://legacy.rma.usda.gov/pubs/2008/ratemethodology.pdf
+                  
+                  group_data <- worklist[ss][contiguous, on = .(state_cd, county_cd), nomatch = 0
+                  ][, .(state_cd = Contiguous.State.Code, county_cd = Contiguous.County.Code)]
+                  
+                  target_data <- worklist[ss][statplan, on = .(state_cd, county_cd), nomatch = 0]
+                  group_data  <- unique(rbind(group_data[statplan  , on = .(state_cd, county_cd), nomatch = 0],target_data))
+                  
+                  # County Group LCR and Variance(includes target):
+                  group_data <- group_data[, .(
+                    c_alpha = mean(net_acre,na.rm=T),
+                    c_a = var(lcr,na.rm=T),
+                    c_u = mean(lcr,na.rm=T)), by = .(crop_cd)]
+                  
+                  # Target County LCR & Variance
+                  target_data <- target_data[, .(
+                    c_v = var(lcr,na.rm=T), 
+                    c_x = mean(lcr,na.rm=T),
+                    c_net_acre = sum(net_acre,na.rm=T)), by = .(state_cd,county_cd,crop_cd)]
+                  
+                  data <- target_data[group_data, on = .(crop_cd), nomatch = 0] # this line is an inner join of two data.table: target_data(main) and group_data(lookup table) using the crop_cd column as the common column. The nomatch = 0 tells data.table to exclude rows from target_data that do not have a match in group_data.
+                  data[, c_P := c_net_acre/c_alpha]
+                  data[, c_K := c_v/c_a]
+                  data[, c_Z := c_P/(c_P+c_K)]
+                  data[, tau := c_Z*c_x + (1-c_Z)*c_u] # County Unloaded Rate (same as target rate).
+                  return(as.data.frame(data)[c("state_cd","county_cd","crop_cd","tau")])
+                }, error = function(e){return(NULL)})
+              }), fill = TRUE)
+          
+          # Fill in missing values using contiguous counties' mean
+          setDT(ADM)
+          contiguous <- readRDS("ContiguousCounty.rds")
+          setDT(contiguous)
+          contiguous[, state_cd := Contiguous.State.Code]
+          contiguous[, county_cd := Contiguous.County.Code]
+          contiguous_adm <- unique(contiguous, by = c("State.Code", "County.Code"))
+          
+          contiguous_adm <- data.table::rbindlist(
+            lapply(
+              1:nrow(contiguous_adm),
+              function(ss){
+                tryCatch({
+                  # ss <- 1
+                  data <- contiguous_adm[ss][contiguous, on = .(State.Code, County.Code), nomatch = 0][
+                    ADM, on = .(state_cd, county_cd), nomatch = 0]
+                  
+                  data <- data[, .(tau_c = mean(tau, na.rm = TRUE)),by = .(State.Code, County.Code, crop_cd)]
+                  
+                  setnames(data, old = c("State.Code", "County.Code"), new = c("state_cd", "county_cd"))
+                  return(data)
+                }, error = function(e){return(NULL)})
+              }), fill = TRUE)
+          
+          ADM <- ADM[contiguous_adm, on = intersect(names(ADM), names(contiguous_adm)), nomatch = 0]
+          ADM[, tau_sob := fifelse(tau %in% c(NA, Inf, -Inf, NaN) | tau == 0, tau_c, tau)]
+          rm(contiguous_adm);gc()
+          ADM <- as.data.frame(ADM)
+          ADM <- ADM[names(ADM)[!names(ADM) %in% c("tau_c","tau")]]
+          ADM <- ADM[!ADM$tau %in% c(NA, Inf, -Inf, NaN,0),]
+          ADM <- dplyr::inner_join(unique(as.data.frame(soball[crop_yr %in% year])[c("crop_yr","state_cd","state_ab","county_cd","county","crop_cd","crop")]),
+                                   ADM, by=names(ADM)[names(ADM) %in% c("crop_yr","state_cd","state_ab","county_cd","county","crop_cd","crop")])
+          gc() # garbage collection frees up the memory
+          return(ADM)
+        }, error = function(e){return(NULL)})
+      }), fill = TRUE))
+
+# Save the processed data to an RDS file for use
+saveRDS(instruments, "temp.rds")
+
+
+
+# merge Instrument (i.e., target rate) aggregated directly from RMA’s actuarial data master 
+adm <- readRDS("fcip_instruments_from_adm.rds")
+instruments <- dplyr::full_join(instruments,adm, by=names(instruments)[names(instruments) %in% names(adm)])
+
+# formulate and merge national subsidy rate instrument as described by (Yu et al., 2018)
+yu2018 <- as.data.frame(
+  data.table::rbindlist(
+    lapply(
+      list.files(recursive = T,full.names = T,pattern = "sobcov_"),
+      function(file){
+        return(readRDS(file))
+      }), fill = TRUE))
+yu2018 <- yu2018[yu2018$delivery_sys %in% c("RBUP","FBUP"),]
+yu2018 <- yu2018[yu2018$ins_plan_cd %in% c(1:3,90,44,25,42),]
+yu2018$cov_lvl  <- paste0("subsidy_rate_",(round((yu2018$cov_lvl/0.05))*0.05)*100)
+yu2018 <- yu2018[yu2018$cov_lvl %in% c("subsidy_rate_65","subsidy_rate_75"),]
+yu2018 <- doBy::summaryBy(subsidy+total_prem~crop_yr+cov_lvl,data=yu2018,FUN=sum,na.rm=T,keep.names = T) # This code creates a new data frame (yu2018) with the subsidy and total_prem columns summed for each combination of crop_yr and cov_lvl, and replaces the original yu2018 object with this summary.
+yu2018$subsidy <- yu2018$subsidy/yu2018$total_prem
+yu2018 <- yu2018[c("crop_yr","cov_lvl","subsidy")] %>% tidyr::spread(cov_lvl, subsidy) # This code reshapes yu2018 so that each unique crop_yr has a single row, with columns for each unique cov_lvl containing the subsidy values. This format is useful for comparing subsidy values across different coverage levels (cov_lvl) within each year (crop_yr).
+instruments <- dplyr::full_join(instruments,yu2018, by=names(instruments)[names(instruments) %in% names(yu2018)])
+
+# tau_final: Same as tau_adm with missing data filled in with tau_sob (as is). 
+instruments$tau_final <- ifelse(instruments$tau_adm %in% c(NA,Inf,-Inf,NaN,0),instruments$tau_sob,instruments$tau_adm)
+
+instruments <- instruments[c("crop_yr","state_ab","state_cd","county","county_cd","crop","crop_cd",
+                             "tau_sob","tau_adm","tau_final","subsidy_rate_65","subsidy_rate_75")]
+instruments <- instruments[!instruments$tau_final %in% c(NA,Inf,-Inf,NaN,0),]
+
+# Save the processed data to an RDS file for use
+saveRDS(instruments, "final_fcip_instruments.rds")
+
+

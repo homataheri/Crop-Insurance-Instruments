@@ -18,9 +18,9 @@ crop: Name of the crop/commodity
 
 crop_cd: The Risk Management Agency (RMA) code that denotes the crop/commodity for which the policy is issued.
 
-tau_sob: An approximation of the “target rate” as described by (Tsiboe & Turner, 2023). Tau effectively tracks changes in the cost of crop insurance that are plausible exogenous to any one producer. It is estimaetd from historic SOB data
+tau_sob: An approximation of the “target rate” as described by (Tsiboe & Turner, 2023). Tau effectively tracks changes in the cost of crop insurance that are plausible exogenous to any one producer. It is estimated from historic SOB data
 
-tau_adm: An approximation of the “target rate” as described by (Tsiboe & Turner, 2023). Tau effectively tracks changes in the cost of crop insurance that are plausible exogenous to any one producer. It is estimaetd by aggregating directly from RMA’s actuarial data master 
+tau_adm: An approximation of the “target rate” as described by (Tsiboe & Turner, 2023). Tau effectively tracks changes in the cost of crop insurance that are plausible exogenous to any one producer. It is estimated by aggregating directly from RMA’s actuarial data master 
 
 tau_final: Same as tau_adm with missing data filled in with tau_sob (as is). 
 
