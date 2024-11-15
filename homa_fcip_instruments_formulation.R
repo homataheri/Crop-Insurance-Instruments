@@ -5,7 +5,7 @@
 # 1. Tsiboe,F. and Turner, D., 2023. Econometric identification of crop insurance participation. Agricultural and Resource Economics Review, 52(3):476-497. https://doi.org/10.1017/age.2023.13
 # 2. Tsiboe,F. and Turner, D., 2023. The crop insurance demand response to premium subsidies: Evidence from US Agriculture. Food Policy, 119. https://doi.org/10.1016/j.foodpol.2023.102505
 
-rm(list=ls(all=TRUE));gc();library(data.table);library(magrittr)
+rm(list=ls(all=TRUE));gc();library(data.table);library(magrittr); library(dplyr)
 # Read and process the Sum of Business Coverages (SOBCOV) dataset
 sobcov <- as.data.frame(
   data.table::rbindlist(
@@ -49,8 +49,7 @@ rm(soball00, sobscc, sobcov)
 # Calculate Loss Cost Ratio (LCR) for risk assessment
 soball[, lcr := indem_amt/liability_amt] # This line of code in R is creating a new column called lcr in the soball data.table by calculating the ratio of indem_amt to liability_amt for each row.This operation is performed in-place, meaning the column is added directly to soball without creating a new copy of the data.
 
-# Define helper function for calculating the "unloaded rate", tau 
-library(dplyr)
+## Define helper function for calculating the "unloaded rate", tau 
 
 # Helper function to load and format contiguous county data
 load_contiguous_data <- function() {
@@ -98,24 +97,70 @@ calculate_unloaded_rate <- function(ss, worklist, statplan, contiguous){
 
 # Function to handle missing values with contiguous county averages
 
-fill_missing_values <- function(ADM, contiguous){
-  contiguous_adm <-  unique(contiguous, by = c("State.Code", "County.Code"))
+fill_missing_values <- function(ADM, contiguous) {
+
+  contiguous_adm <- unique(contiguous, by = c("State.Code", "County.Code"))
+  
   filled_data <- rbindlist(
-    lapply(1:nrow(contiguous_adm)), function(ss){
+    lapply(1:nrow(contiguous_adm), function(ss) {
       tryCatch({
         data <- contiguous_adm[ss][contiguous, on = .(State.Code, County.Code), nomatch = 0][
           ADM, on = .(state_cd, county_cd), nomatch = 0]
         data <- data[, .(tau_c = mean(tau, na.rm = TRUE)), by = .(State.Code, County.Code, crop_cd)]
         setnames(data, old = c("State.Code", "County.Code"), new = c("state_cd", "county_cd"))
         return(data)
-      }, error = function(e) NULL}), fill = TRUE)
+      }, error = function(e) NULL)
+    }), fill = TRUE
+  )
 
-ADM <- ADM[filled_data, on = intersect(names(ADM), names(filled_data)), nomatch = 0]
-ADM[, tau := ifelse(is.na(tau)| tau %>% c(Inf, -Inf, NaN, 0) , tau_c, tau)]
-return(ADM)
+  ADM <- ADM[filled_data, on = intersect(names(ADM), names(filled_data)), nomatch = 0]
+  ADM[, tau := ifelse(is.na(tau) | tau %in% c(Inf, -Inf, NaN, 0), tau_c, tau)]
+  
+  return(ADM)
 }
 
+## Main code block
 
+# Load contiguous data once
+contiguous <- load_contiguous_data()
+
+
+# Main loop over years
+instruments <- rbindlist(
+  lapply((min(soball$crop_yr) + 22):max(soball$crop_yr), function(year) {
+    tryCatch({
+      # Get relevant historical data for the current year
+      statplan <- soball[crop_yr %in% (year - 2):(year - 21)]
+      
+      # Unique state and county combinations
+      worklist <- unique(statplan[, .(state_cd, county_cd)])
+      
+      # Calculate unloaded rate for each county
+      ADM <- rbindlist(
+        lapply(1:nrow(worklist), function(ss) {
+          calculate_unloaded_rate(ss, worklist, statplan, contiguous)
+        }), fill = TRUE
+      )
+      
+      # Fill in missing values using contiguous counties' means
+      ADM <- fill_missing_values(as.data.table(ADM), contiguous)
+      
+      # Filter invalid values and prepare final output
+      ADM <- ADM[!is.na(tau) & tau != 0, .(state_cd, county_cd, crop_cd, tau)]
+      ADM <- inner_join(
+        unique(as.data.frame(soball[crop_yr == year, .(crop_yr, state_cd, state_ab, county_cd, county, crop_cd, crop)])),
+        as.data.frame(ADM),
+        by = intersect(names(ADM), names(soball))
+      )
+      gc() # Memory cleanup
+      
+      return(ADM)
+    }, error = function(e) NULL)
+  }), fill = TRUE
+)
+
+
+#########################################
 
 
 # Loop through years to process data and calculate target rate (tau).
